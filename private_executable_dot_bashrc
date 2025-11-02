@@ -81,10 +81,10 @@ alias ll='ls -lh'
 alias la='ls -lha'
 alias l='ls -CF'
 alias em='emacs -nw'
-alias _='sudo'
-alias _i='sudo -i'
-alias fucking='sudo'
-alias please='sudo'
+# alias _='sudo'
+# alias _i='sudo -i'
+# alias fucking='sudo'
+# alias please='sudo'
 
 # Set 'man' colors
 if [ "$color_prompt" = yes ]; then
@@ -136,3 +136,4 @@ fi
 export PATH="$PATH:/opt/nvim"
 export PS1="\[\033[0;31m\]┌─\$([[ \$? != 0 ]] && echo \"[\[\033[0;31m\]✗\[\033[0;37m\]]─\")[\[\033[0;39m\]user\[\033[01;33m\]@\[\033[01;96m\]anonymous\[\033[0;31m\]]─[\[\033[0;32m\]\w\[\033[0;31m\]]\n\[\033[0;31m\]└──╼ \[\033[0m\]\[\e[01;33m\]\$\[\e[0m\] "
 eval "$(mise activate bash)"
+export PATH="$HOME/.local/bin:$PATH"
