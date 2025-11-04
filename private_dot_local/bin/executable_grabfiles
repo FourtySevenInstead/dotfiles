@@ -1,0 +1,348 @@
+#!/bin/bash
+
+# Check if running in zsh or bash and apply appropriate error handling
+if [ -n "${ZSH_VERSION:-}" ]; then
+	setopt ERR_EXIT # Equivalent to errexit in zsh
+elif [ -n "${BASH_VERSION:-}" ]; then
+	set -o pipefail # Use pipefail if running in bash
+fi
+
+set -o errexit
+set -o nounset
+
+# Secure the PATH
+# export PATH="/usr/local/bin:/usr/bin:/bin"
+
+# Unset potentially harmful environment variables and functions
+unset IFS
+
+# Unset functions in a more portable way (compatible with zsh and bash)
+if [ -n "${ZSH_VERSION:-}" ]; then
+	for fn in $(typeset -f); do
+		unset -f "$fn"
+	done
+elif [ -n "${BASH_VERSION:-}" ]; then
+	for fn in $(compgen -A function); do
+		unset -f "$fn"
+	done
+fi
+
+# Disable filename expansion (globbing)
+set -o noglob
+
+# Allowed directories
+ALLOWED_DIRS=(
+	"$HOME/Projects"
+	# "$HOME/Jetbrains"
+	"$HOME/Documents"
+	# "$HOME/PycharmProjects"
+	"$HOME/scripts"
+	# "$HOME/WebstormProjects"
+	# "$HOME/WritersideProjects"
+	# "$HOME/vagrant/opensuse-tumbleweed"
+	# "$HOME/RustroverProjects"
+	"$HOME/.config/nvim"
+)
+
+# Maximum number of files to process
+MAX_FILES=100
+
+# Function to check if a command exists
+command_exists() {
+	command -v "$1" >/dev/null 2>&1
+}
+
+# Ensure xclip is installed
+ensure_xclip() {
+	if ! command_exists xclip; then
+		>&2 echo "Error: xclip is not installed. Please install it using 'sudo apt-get install xclip'."
+		exit 1
+	fi
+}
+
+# Display help message
+display_help() {
+	cat <<EOF
+Usage: grabfiles [OPTIONS] [<repo_path> | <file_paths>...]
+
+Copy the paths and contents of files to the clipboard.
+
+Options:
+  -h, --help             Display this help and exit
+  --include-hidden       Include hidden files (e.g., .<name>) in the output
+  --include-content      Include file contents in the console output (for debugging)
+  --from-clipboard       Read the list of file paths from the clipboard
+
+Examples:
+  grabfiles \$HOME/Projects/myproject
+  grabfiles --include-hidden \$HOME/Projects/myproject
+  grabfiles --from-clipboard
+  grabfiles /path/to/file1 /path/to/file2
+
+Allowed directories:
+EOF
+	for dir in "${ALLOWED_DIRS[@]}"; do
+		echo "  $dir"
+	done
+	exit 0
+}
+
+# Escape content for markdown
+escape_content() {
+	local content="$1"
+	printf '%s\n' "$content" | sed 's/`/\\`/g'
+}
+
+# Sanitize clipboard content
+sanitize_clipboard_content() {
+	local sanitized=()
+	for line in "${file_list[@]}"; do
+		# Remove non-printable characters
+		line=$(echo "$line" | tr -cd '\11\12\15\40-\176')
+		sanitized+=("$line")
+	done
+	file_list=("${sanitized[@]}")
+}
+
+# Validate file paths
+validate_file_paths() {
+	local file_paths=("$@")
+	local valid_paths=()
+	for file_path in "${file_paths[@]}"; do
+		# Skip empty paths
+		if [ -z "$file_path" ]; then
+			continue
+		fi
+
+		# Check for directory traversal (..)
+		if echo "$file_path" | grep -q '\.\.'; then
+			>&2 echo "Warning: Suspicious file path '$file_path' contains '..'. Skipping."
+			continue
+		fi
+
+		# Convert to absolute path
+		file_path=$(realpath "$file_path" 2>/dev/null)
+		if [ -z "$file_path" ]; then
+			>&2 echo "Warning: Could not resolve path '$file_path'. Skipping."
+			continue
+		fi
+
+		local is_valid=0
+		for allowed_dir in "${ALLOWED_DIRS[@]}"; do
+			if [[ "$file_path" == "$allowed_dir"* ]]; then
+				if [ ! -f "$file_path" ]; then
+					>&2 echo "Warning: '$file_path' is not a valid file."
+					continue 2
+				fi
+				is_valid=1
+				break
+			fi
+		done
+		if [ "$is_valid" -eq 0 ]; then
+			>&2 echo "Warning: '$file_path' is not in the list of allowed directories."
+			continue
+		fi
+		valid_paths+=("$file_path")
+	done
+	printf '%s\n' "${valid_paths[@]}"
+}
+
+# Function to get the list of files
+get_file_list() {
+	local from_clipboard="$1"
+	local include_hidden="$2"
+	local repo_path="$3"
+	shift 3
+	local args=("$@")
+	local file_list=()
+
+	if [ "$from_clipboard" -eq 1 ]; then
+		# Read file paths from the clipboard
+		if ! command_exists xclip; then
+			>&2 echo "Error: xclip is required to read from the clipboard."
+			exit 1
+		fi
+		mapfile -t file_list < <(xclip -o -selection clipboard)
+
+		# Sanitize clipboard content
+		sanitize_clipboard_content
+
+		# Limit number of files
+		if [ "${#file_list[@]}" -gt "$MAX_FILES" ]; then
+			>&2 echo "Error: Too many files in clipboard. Maximum allowed is $MAX_FILES."
+			exit 1
+		fi
+
+	elif [ "${#args[@]}" -gt 0 ]; then
+		# Use file paths provided as arguments
+		file_list=("${args[@]}")
+	elif [ -n "$repo_path" ]; then
+		# Get tracked files from the Git repository
+		if [ "$include_hidden" -eq 1 ]; then
+			mapfile -t file_list < <(git -C "$repo_path" ls-files)
+		else
+			mapfile -t file_list < <(git -C "$repo_path" ls-files | grep -v '^\.')
+		fi
+		# Prepend repo_path to each file
+		for i in "${!file_list[@]}"; do
+			file_list[$i]="$repo_path/${file_list[$i]}"
+		done
+	else
+		>&2 echo "Error: No file paths provided."
+		exit 1
+	fi
+
+	printf '%s\n' "${file_list[@]}"
+}
+
+# Function to process files
+process_files() {
+	local file_paths=("$@")
+	local output=""
+	local empty_files=()
+	local copied_paths=()
+	readonly MAX_FILE_SIZE="${MAX_FILE_SIZE:-1048576}"
+
+	for file_path in "${file_paths[@]}"; do
+		if [ -z "$file_path" ] || [ ! -f "$file_path" ]; then
+			output+="< $(printf '%q' "$file_path") >\n\`\`\`\nCould not read file\n\`\`\`\n\n"
+			copied_paths+=("$file_path")
+			continue
+		fi
+
+		# Check if file is a symlink
+		if [ -L "$file_path" ]; then
+			>&2 echo "Skipping symlink: $file_path"
+			continue
+		fi
+
+		# Check file size
+		local file_size
+		file_size=$(stat -c%s "$file_path")
+
+		# Check if file is empty (0 bytes)
+		if [ "$file_size" -eq 0 ]; then
+			empty_files+=("$file_path")
+			continue
+		fi
+
+		if [ "$file_size" -gt "$MAX_FILE_SIZE" ]; then
+			output+="< $(printf '%q' "$file_path") >\n\`\`\`\nFile too large to process\n\`\`\`\n\n"
+			copied_paths+=("$file_path")
+			continue
+		fi
+
+		# Skip actual binaries, but allow common text formats like JSON/Lua (even if misdetected as JS)
+		local mime_type
+		mime_type=$(file --mime-type -b "$file_path")
+		local ext="${file_path##*.}"
+		if [[ $mime_type != text/* && $mime_type != application/json && ($mime_type != application/javascript || $ext != "lua") ]]; then
+			>&2 echo "Skipping binary file: $file_path (MIME: $mime_type)"
+			continue
+		fi
+
+		local content
+		if content=$(<"$file_path"); then
+			# Check for null bytes
+			if printf '%s' "$content" | grep -qP '\x00'; then
+				>&2 echo "Warning: Null byte found and removed in file: $file_path"
+				# Remove null bytes
+				content=$(printf '%s' "$content" | tr -d '\0')
+			fi
+
+			local escaped_content
+			escaped_content=$(escape_content "$content")
+			output+="< $(printf '%q' "$file_path") >\n\`\`\`\n$escaped_content\n\`\`\`\n\n"
+			copied_paths+=("$file_path")
+		else
+			output+="< $(printf '%q' "$file_path") >\n\`\`\`\nError reading file content\n\`\`\`\n\n"
+			copied_paths+=("$file_path")
+		fi
+	done
+
+	# Add empty files list to clipboard output
+	if [ "${#empty_files[@]}" -gt 0 ]; then
+		output+="# Empty Files (0 bytes)\n\n"
+		for empty_file in "${empty_files[@]}"; do
+			output+="- $empty_file\n"
+			copied_paths+=("$empty_file")
+		done
+		output+="\n"
+	fi
+
+	if [ -z "$output" ] && [ "${#empty_files[@]}" -eq 0 ]; then
+		>&2 echo "No files to process."
+	else
+		printf '%b' "$output" | xclip -selection clipboard
+		echo "The file paths and contents have been copied to your clipboard."
+		if [ "${#empty_files[@]}" -gt 0 ]; then
+			>&2 echo "Note: ${#empty_files[@]} empty file(s) added to clipboard output."
+		fi
+		if [ "${#copied_paths[@]}" -gt 0 ]; then
+			echo "Paths of copied files:"
+			for path in "${copied_paths[@]}"; do
+				echo "$path"
+			done
+		fi
+	fi
+}
+
+main() {
+	ensure_xclip
+
+	local INCLUDE_HIDDEN=0
+	local FROM_CLIPBOARD=0
+	local repo_path=""
+	local positional_args=()
+
+	while [[ "$#" -gt 0 ]]; do
+		case "$1" in
+		-h | --help)
+			display_help
+			;;
+		--include-hidden)
+			INCLUDE_HIDDEN=1
+			shift
+			;;
+		--include-content)
+			shift
+			;;
+		--from-clipboard)
+			FROM_CLIPBOARD=1
+			shift
+			;;
+		*)
+			positional_args+=("$1")
+			shift
+			;;
+		esac
+	done
+
+	if [ "$FROM_CLIPBOARD" -eq 0 ] && [ "${#positional_args[@]}" -eq 0 ]; then
+		>&2 echo "Error: No file paths or repository path provided."
+		>&2 echo "Try '$0 --help' for more information."
+		exit 1
+	fi
+
+	local file_list=()
+	if [ "$FROM_CLIPBOARD" -eq 1 ]; then
+		mapfile -t file_list < <(get_file_list "$FROM_CLIPBOARD" "$INCLUDE_HIDDEN" "" "${positional_args[@]}")
+	elif [ -d "${positional_args[0]}" ] && [ -d "${positional_args[0]}/.git" ]; then
+		repo_path=$(realpath "${positional_args[0]}")
+		mapfile -t file_list < <(get_file_list "$FROM_CLIPBOARD" "$INCLUDE_HIDDEN" "$repo_path")
+	else
+		file_list=("${positional_args[@]}")
+	fi
+
+	# Validate the file paths
+	mapfile -t valid_file_paths < <(validate_file_paths "${file_list[@]}")
+
+	if [ "${#valid_file_paths[@]}" -eq 0 ]; then
+		>&2 echo "No valid files to process."
+		exit 1
+	fi
+
+	process_files "${valid_file_paths[@]}"
+}
+
+main "$@"
