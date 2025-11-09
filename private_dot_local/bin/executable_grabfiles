@@ -72,6 +72,7 @@ Options:
   --include-hidden       Include hidden files (e.g., .<name>) in the output
   --include-content      Include file contents in the console output (for debugging)
   --from-clipboard       Read the list of file paths from the clipboard
+  --copy-to-file, -ctf   Write the gathered content to a temporary file and copy the file reference to clipboard
 
 Examples:
   grabfiles \$HOME/Projects/myproject
@@ -195,8 +196,30 @@ get_file_list() {
 	printf '%s\n' "${file_list[@]}"
 }
 
+# Function to URL encode a string
+urlencode() {
+	local length="${#1}"
+	for (( i = 0; i < length; i++ )); do
+		local c="${1:i:1}"
+		case $c in
+			[a-zA-Z0-9.~/-]) printf "%s" "$c" ;;
+			*) printf '%%%02X' "'$c" ;;
+		esac
+	done
+}
+
+# Function to copy file reference to clipboard using xclip
+copy_file_to_clipboard() {
+	local file_path="$1"
+	local encoded_path
+	encoded_path=$(urlencode "$file_path")
+	printf "file://%s\r\n" "$encoded_path" | xclip -i -selection clipboard -target text/uri-list
+}
+
 # Function to process files
 process_files() {
+	local copy_to_file="$1"
+	shift
 	local file_paths=("$@")
 	local output=""
 	local empty_files=()
@@ -205,7 +228,7 @@ process_files() {
 
 	for file_path in "${file_paths[@]}"; do
 		if [ -z "$file_path" ] || [ ! -f "$file_path" ]; then
-			output+="< $(printf '%q' "$file_path") >\n\`\`\`\nCould not read file\n\`\`\`\n\n"
+			output+="< $(printf '%q' "$file_path") >"$'\n'"\`\`\`"$'\n'"Could not read file"$'\n'"\`\`\`"$'\n\n'
 			copied_paths+=("$file_path")
 			continue
 		fi
@@ -227,7 +250,7 @@ process_files() {
 		fi
 
 		if [ "$file_size" -gt "$MAX_FILE_SIZE" ]; then
-			output+="< $(printf '%q' "$file_path") >\n\`\`\`\nFile too large to process\n\`\`\`\n\n"
+			output+="< $(printf '%q' "$file_path") >"$'\n'"\`\`\`"$'\n'"File too large to process"$'\n'"\`\`\`"$'\n\n'
 			copied_paths+=("$file_path")
 			continue
 		fi
@@ -252,29 +275,37 @@ process_files() {
 
 			local escaped_content
 			escaped_content=$(escape_content "$content")
-			output+="< $(printf '%q' "$file_path") >\n\`\`\`\n$escaped_content\n\`\`\`\n\n"
+			output+="< $(printf '%q' "$file_path") >"$'\n'"\`\`\`"$'\n'"$escaped_content"$'\n'"\`\`\`"$'\n\n'
 			copied_paths+=("$file_path")
 		else
-			output+="< $(printf '%q' "$file_path") >\n\`\`\`\nError reading file content\n\`\`\`\n\n"
+			output+="< $(printf '%q' "$file_path") >"$'\n'"\`\`\`"$'\n'"Error reading file content"$'\n'"\`\`\`"$'\n\n'
 			copied_paths+=("$file_path")
 		fi
 	done
 
 	# Add empty files list to clipboard output
 	if [ "${#empty_files[@]}" -gt 0 ]; then
-		output+="# Empty Files (0 bytes)\n\n"
+		output+="# Empty Files (0 bytes)"$'\n\n'
 		for empty_file in "${empty_files[@]}"; do
-			output+="- $empty_file\n"
+			output+="- $empty_file"$'\n'
 			copied_paths+=("$empty_file")
 		done
-		output+="\n"
+		output+=$'\n'
 	fi
 
 	if [ -z "$output" ] && [ "${#empty_files[@]}" -eq 0 ]; then
 		>&2 echo "No files to process."
 	else
-		printf '%b' "$output" | xclip -selection clipboard
-		echo "The file paths and contents have been copied to your clipboard."
+		if [ "$copy_to_file" -eq 1 ]; then
+			local temp_file
+			temp_file=$(mktemp /tmp/grabfiles_output.XXXXXX.md)
+			printf '%s' "$output" >"$temp_file"
+			copy_file_to_clipboard "$temp_file"
+			echo "The output has been written to $temp_file and its reference copied to your clipboard."
+		else
+			printf '%s' "$output" | xclip -selection clipboard
+			echo "The file paths and contents have been copied to your clipboard."
+		fi
 		if [ "${#empty_files[@]}" -gt 0 ]; then
 			>&2 echo "Note: ${#empty_files[@]} empty file(s) added to clipboard output."
 		fi
@@ -292,6 +323,7 @@ main() {
 
 	local INCLUDE_HIDDEN=0
 	local FROM_CLIPBOARD=0
+	local COPY_TO_FILE=0
 	local repo_path=""
 	local positional_args=()
 
@@ -309,6 +341,10 @@ main() {
 			;;
 		--from-clipboard)
 			FROM_CLIPBOARD=1
+			shift
+			;;
+		--copy-to-file | -ctf)
+			COPY_TO_FILE=1
 			shift
 			;;
 		*)
@@ -342,7 +378,7 @@ main() {
 		exit 1
 	fi
 
-	process_files "${valid_file_paths[@]}"
+	process_files "$COPY_TO_FILE" "${valid_file_paths[@]}"
 }
 
 main "$@"
