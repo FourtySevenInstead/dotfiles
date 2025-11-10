@@ -11,7 +11,7 @@ set -o errexit
 set -o nounset
 
 # Secure the PATH
-# export PATH="/usr/local/bin:/usr/bin:/bin"
+export PATH="/usr/local/bin:/usr/bin:/bin"
 
 # Unset potentially harmful environment variables and functions
 unset IFS
@@ -30,22 +30,30 @@ fi
 # Disable filename expansion (globbing)
 set -o noglob
 
-# Allowed directories
-ALLOWED_DIRS=(
-	"$HOME/Projects"
-	# "$HOME/Jetbrains"
-	"$HOME/Documents"
-	# "$HOME/PycharmProjects"
-	"$HOME/scripts"
-	# "$HOME/WebstormProjects"
-	# "$HOME/WritersideProjects"
-	# "$HOME/vagrant/opensuse-tumbleweed"
-	# "$HOME/RustroverProjects"
-	"$HOME/.config/nvim"
-)
+# Allowed directories (configurable via env var with fallback)
+ALLOWED_DIRS_ENV="${ALLOWED_DIRS_ENV:-}"
+if [ -n "$ALLOWED_DIRS_ENV" ]; then
+	IFS=':' read -r -a ALLOWED_DIRS <<<"$ALLOWED_DIRS_ENV"
+else
+	ALLOWED_DIRS=(
+		"$HOME/Projects"
+		# "$HOME/Jetbrains"
+		"$HOME/Documents"
+		# "$HOME/PycharmProjects"
+		"$HOME/scripts"
+		# "$HOME/WebstormProjects"
+		# "$HOME/WritersideProjects"
+		# "$HOME/vagrant/opensuse-tumbleweed"
+		# "$HOME/RustroverProjects"
+		"$HOME/.config/nvim"
+	)
+fi
 
 # Maximum number of files to process
 MAX_FILES=100
+
+# Maximum line length for clipboard paths
+MAX_LINE_LENGTH=1024
 
 # Function to check if a command exists
 command_exists() {
@@ -80,7 +88,7 @@ Examples:
   grabfiles --from-clipboard
   grabfiles /path/to/file1 /path/to/file2
 
-Allowed directories:
+Allowed directories (configurable via ALLOWED_DIRS_ENV env var):
 EOF
 	for dir in "${ALLOWED_DIRS[@]}"; do
 		echo "  $dir"
@@ -88,10 +96,15 @@ EOF
 	exit 0
 }
 
-# Escape content for markdown
+# Escape content for markdown, handling triple backticks
 escape_content() {
 	local content="$1"
-	printf '%s\n' "$content" | sed 's/`/\\`/g'
+	# Escape backticks and use longer delimiter if triple backticks are present
+	if printf '%s\n' "$content" | grep -q '```'; then
+		printf '%s\n' "$content" | sed 's/`/\\`/g' | sed '1s/^/````\n/; $s/$/\n````/'
+	else
+		printf '%s\n' "$content" | sed 's/`/\\`/g'
+	fi
 }
 
 # Sanitize clipboard content
@@ -100,9 +113,45 @@ sanitize_clipboard_content() {
 	for line in "${file_list[@]}"; do
 		# Remove non-printable characters
 		line=$(echo "$line" | tr -cd '\11\12\15\40-\176')
+		# Skip if line exceeds max length
+		if [ "${#line}" -gt "$MAX_LINE_LENGTH" ]; then
+			>&2 echo "Warning: Skipping overly long clipboard line: ${line:0:50}..."
+			continue
+		fi
 		sanitized+=("$line")
 	done
 	file_list=("${sanitized[@]}")
+}
+
+# Validate path against allowed directories
+validate_path() {
+	local path="$1"
+	# Check for directory traversal (..)
+	if echo "$path" | grep -q '\.\.'; then
+		>&2 echo "Warning: Suspicious path '$path' contains '..'. Skipping."
+		return 1
+	fi
+
+	# Convert to absolute path
+	path=$(realpath "$path" 2>/dev/null)
+	if [ -z "$path" ]; then
+		>&2 echo "Warning: Could not resolve path '$path'. Skipping."
+		return 1
+	fi
+
+	local is_valid=0
+	for allowed_dir in "${ALLOWED_DIRS[@]}"; do
+		if [[ "$path" == "$allowed_dir"* ]]; then
+			is_valid=1
+			break
+		fi
+	done
+	if [ "$is_valid" -eq 0 ]; then
+		>&2 echo "Warning: '$path' is not in the list of allowed directories."
+		return 1
+	fi
+	echo "$path"
+	return 0
 }
 
 # Validate file paths
@@ -115,35 +164,17 @@ validate_file_paths() {
 			continue
 		fi
 
-		# Check for directory traversal (..)
-		if echo "$file_path" | grep -q '\.\.'; then
-			>&2 echo "Warning: Suspicious file path '$file_path' contains '..'. Skipping."
+		local resolved_path
+		resolved_path=$(validate_path "$file_path")
+		if [ $? -ne 0 ]; then
 			continue
 		fi
 
-		# Convert to absolute path
-		file_path=$(realpath "$file_path" 2>/dev/null)
-		if [ -z "$file_path" ]; then
-			>&2 echo "Warning: Could not resolve path '$file_path'. Skipping."
+		if [ ! -f "$resolved_path" ]; then
+			>&2 echo "Warning: '$resolved_path' is not a valid file."
 			continue
 		fi
-
-		local is_valid=0
-		for allowed_dir in "${ALLOWED_DIRS[@]}"; do
-			if [[ "$file_path" == "$allowed_dir"* ]]; then
-				if [ ! -f "$file_path" ]; then
-					>&2 echo "Warning: '$file_path' is not a valid file."
-					continue 2
-				fi
-				is_valid=1
-				break
-			fi
-		done
-		if [ "$is_valid" -eq 0 ]; then
-			>&2 echo "Warning: '$file_path' is not in the list of allowed directories."
-			continue
-		fi
-		valid_paths+=("$file_path")
+		valid_paths+=("$resolved_path")
 	done
 	printf '%s\n' "${valid_paths[@]}"
 }
@@ -178,6 +209,15 @@ get_file_list() {
 		# Use file paths provided as arguments
 		file_list=("${args[@]}")
 	elif [ -n "$repo_path" ]; then
+		# Validate repo_path first
+		local validated_repo
+		validated_repo=$(validate_path "$repo_path")
+		if [ $? -ne 0 ]; then
+			>&2 echo "Error: Invalid repository path."
+			exit 1
+		fi
+		repo_path="$validated_repo"
+
 		# Get tracked files from the Git repository
 		if [ "$include_hidden" -eq 1 ]; then
 			mapfile -t file_list < <(git -C "$repo_path" ls-files)
@@ -199,11 +239,11 @@ get_file_list() {
 # Function to URL encode a string
 urlencode() {
 	local length="${#1}"
-	for (( i = 0; i < length; i++ )); do
+	for ((i = 0; i < length; i++)); do
 		local c="${1:i:1}"
 		case $c in
-			[a-zA-Z0-9.~/-]) printf "%s" "$c" ;;
-			*) printf '%%%02X' "'$c" ;;
+		[a-zA-Z0-9.~/-]) printf "%s" "$c" ;;
+		*) printf '%%%02X' "'$c" ;;
 		esac
 	done
 }
@@ -219,7 +259,8 @@ copy_file_to_clipboard() {
 # Function to process files
 process_files() {
 	local copy_to_file="$1"
-	shift
+	local include_content="$2"
+	shift 2
 	local file_paths=("$@")
 	local output=""
 	local empty_files=()
@@ -236,6 +277,12 @@ process_files() {
 		# Check if file is a symlink
 		if [ -L "$file_path" ]; then
 			>&2 echo "Skipping symlink: $file_path"
+			continue
+		fi
+
+		# Check file permissions (readable by user)
+		if [ ! -r "$file_path" ]; then
+			>&2 echo "Skipping non-readable file: $file_path"
 			continue
 		fi
 
@@ -296,6 +343,10 @@ process_files() {
 	if [ -z "$output" ] && [ "${#empty_files[@]}" -eq 0 ]; then
 		>&2 echo "No files to process."
 	else
+		if [ "$include_content" -eq 1 ]; then
+			echo "Debugging output:"
+			printf '%s\n' "$output"
+		fi
 		if [ "$copy_to_file" -eq 1 ]; then
 			local temp_file
 			temp_file=$(mktemp /tmp/grabfiles_output.XXXXXX.md)
@@ -322,6 +373,7 @@ main() {
 	ensure_xclip
 
 	local INCLUDE_HIDDEN=0
+	local INCLUDE_CONTENT=0
 	local FROM_CLIPBOARD=0
 	local COPY_TO_FILE=0
 	local repo_path=""
@@ -337,6 +389,7 @@ main() {
 			shift
 			;;
 		--include-content)
+			INCLUDE_CONTENT=1
 			shift
 			;;
 		--from-clipboard)
@@ -364,7 +417,7 @@ main() {
 	if [ "$FROM_CLIPBOARD" -eq 1 ]; then
 		mapfile -t file_list < <(get_file_list "$FROM_CLIPBOARD" "$INCLUDE_HIDDEN" "" "${positional_args[@]}")
 	elif [ -d "${positional_args[0]}" ] && [ -d "${positional_args[0]}/.git" ]; then
-		repo_path=$(realpath "${positional_args[0]}")
+		repo_path="${positional_args[0]}"
 		mapfile -t file_list < <(get_file_list "$FROM_CLIPBOARD" "$INCLUDE_HIDDEN" "$repo_path")
 	else
 		file_list=("${positional_args[@]}")
@@ -378,7 +431,7 @@ main() {
 		exit 1
 	fi
 
-	process_files "$COPY_TO_FILE" "${valid_file_paths[@]}"
+	process_files "$COPY_TO_FILE" "$INCLUDE_CONTENT" "${valid_file_paths[@]}"
 }
 
 main "$@"
